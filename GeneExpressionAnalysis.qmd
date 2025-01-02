@@ -1,0 +1,526 @@
+---
+title: "Gene Expression Analysis"
+author: "Anastasiia Deviataieva (Student Number: 24100519)"
+format: html
+  #pdf:
+  #   geometry: 
+  #   - top=1in        
+  #   - bottom=1in     
+  #   - left=1in       
+  #    - right=1in
+  #  extra_dependencies: ["fvextra"]
+#header-includes:
+#  - \usepackage{fvextra}  # Using fvextra to control output
+#  - \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,commandchars=\\\{\}} #for chuncks 
+editor: visual
+execute:
+  error: false
+---
+
+```{r}
+knitr::opts_chunk$set(echo=TRUE, eval=TRUE, tidy = TRUE, tidy.opts = list(width.cutoff = 80)) #Code width
+options(width = 80) #Code output width
+```
+
+# Analysis
+
+The following code loads data from the archive, unpacks it, and prepares it for further analysis. Specify the path to the folder where the archive with data is stored. Next, unpack the archive using the `untar()` function and place it in the current directory. The full path to the `brca_tcga_pan_can_atlas_2018` folder where the archive was unzipped is created, where `getwd()` returns the current working directory. Thus, paths to the main files are created: RNA-seq file, patient data file, and copy number aberrations data. We read text files using the `read.delim()` function. Next, I deleted the first 4 lines from data_patient, as they contained a description of the columns.
+
+```{r}
+# Specify the path to the archive
+downloads_path = "/Users/anastasiiadeviataieva/Desktop/UCD Autumn/BioPrin and CellOrg/Gene expression analysis/Gene Expression Analysis"
+file_path = paste(downloads_path, "brca_tcga_pan_can_atlas_2018.tar", sep = "/")
+
+# Unpack the archive into the same folder
+untar(file_path)
+
+# Check the contents of the folder after unpacking
+# list.files(path = downloads_path)
+
+# Path to the unarchived file
+folder_path = paste(getwd(),"brca_tcga_pan_can_atlas_2018", sep = "/" )
+
+# Paths to files
+data_patient_path = paste(folder_path,"data_clinical_patient.txt", sep = "/")
+path_RNA = paste(folder_path,"data_mrna_seq_v2_rsem.txt", sep = "/")
+path_cna = paste(folder_path,"data_cna.txt", sep = "/")
+
+# Reading files
+data_Rnaseq = read.delim(path_RNA)
+data_patient = read.delim(data_patient_path)
+data_cna = read.delim(path_cna)
+
+data_patient = data_patient[5:dim(data_patient)[1],] # we will skip 5 rows of column descriptions. 
+```
+
+This code does several key things to prepare the metadata that will be used in the data analysis. It takes the column names from the `data_cna` file, starting with column 3 (the first two columns contain the gene names). `substr(..., 1, 12)` truncates the identifiers to the first 12 characters, because patient identifiers are usually unique only by the first 12 characters. Since the patient identifiers in the data_patient file are different, they were converted to the same format as the other two files. `gsub("-", "\.", ...)` replaces hyphens (-) with periods (.), because data_cna stores identifiers in dotted format. The `intersect()` function returns identifiers that are present in both data sets (`cna_ids` and `patient_ids`).
+
+From the RNA-seq data, we remove the first 2 columns that contain gene names and convert the remaining data into a numeric matrix `assay`. The RNA-seq values ​​are rounded to the nearest integer since they must be integers for `DESeq()`. The names of the matrix rows that correspond to the gene names are set. A metadata matrix of size \[number of columns (number of patients) in the assay, 2\] is created. Next, we find the row corresponding to the `ERBB2` gene in the CNA data. We loop through all columns of the assay expression matrix (for each patient), extract the patient ID, check if this ID is in `common_ids` (thereby matching the IDs in the three files). Next, we check if this ID is in `common_ids` (i.e. in both datasets), find the index of this ID in the CNA data.
+
+If the index is found, then:
+
+`metadata[i, 1] <- pat_barcode`: set the patient ID to the first column of metadata;
+
+`metadata[i, 2] <- ifelse(...)` Check HER2 (ERBB2) value in CNA:
+
+-   If $>0$, status = 1 (Amplified).
+
+-   If $\leq 0$, status = 0 (Not Amplified).
+
+If ID not found in common_ids, HER2 status = NA. Converts the `metadata` matrix to data.frame and the `HER2_Status` column to a factor for convenience. `metadata <- metadata[complete.cases(metadata), ]` checks rows for NA and removes them.
+
+```{r}
+# Finding patient identification data
+cna_ids <- substr(colnames(data_cna)[3:ncol(data_cna)], 1, 12)
+patient_ids <- substr(gsub("-", "\\.", data_patient[, 1]), 1, 12)
+# Matching patient identification data
+common_ids <- intersect(cna_ids, patient_ids)
+
+# Cols 1 and 2 are gene names
+assay <- round(as.matrix(data_Rnaseq[, -c(1, 2)])) 
+rownames(assay) <- data_Rnaseq[, 1]
+
+# Build metadata.
+metadata <- matrix(0, ncol(assay), 2)
+
+# Creating metadata with HER2 status
+erbb2_row <- which(data_cna$Hugo_Symbol == "ERBB2")  # Finding the line ERBB2
+for (i in 1:dim(assay)[2]) {
+  pat_barcode <- substr(colnames(assay)[i], 1, 12)
+  # Check if the id is in common_ids
+  if (pat_barcode %in% common_ids) {
+    idx <- match(pat_barcode, cna_ids)
+    if (!is.na(idx)) {
+      metadata[i, 1] <- pat_barcode
+      metadata[i, 2] <- ifelse(as.numeric(data_cna[erbb2_row, idx + 2]) > 0, 1, 0)
+    }
+  }else {
+      metadata[i, 1] <- pat_barcode
+      metadata[i, 2] <- NA
+    } 
+}
+colnames(metadata) <- c("Patient_ID", "HER2_Status") # Setting column names
+# Changing metadata types
+metadata <- as.data.frame(metadata) 
+metadata$HER2_Status <- as.factor(metadata$HER2_Status)
+
+#anyNA(metadata) # Checking for missing values
+#sum(is.na(metadata)) # Calculating amount of missing values
+
+metadata <- metadata[complete.cases(metadata), ] # Remove lines containing NA
+```
+
+For differential gene expression analysis, we need the BiocManager and DESeq2 packages. We check if the packages are installed, and if they are not installed, the code automatically downloads and installs them.
+
+```{r}
+#if (!require("BiocManager", quietly = TRUE))
+#  install.packages("BiocManager")
+# Install DeSeq2
+#if (!require("DESeq2", quietly = TRUE))
+#    BiocManager::install("DESeq2")
+```
+
+All negative values ​​in the assay matrix are replaced with 0. This is important because gene expression reads cannot be negative. Negative values ​​may be the result of errors or incorrect data processing. Next, we remove columns (patient ids) that are not in the metadata but are in the `assay` matrix. `which(... %in% ids_to_remove)` defines the indexes of the columns corresponding to the missing ids. You can also check if the order of the column names in the assay and the patient ids in the `metadata$Patient_ID` match. It is also important to filter out genes with low expression. A minimum number of samples (groups) is set, and then the number of samples for each gene with expression $\geq 10$ is counted. `filtered_assay[keep, ]` removes genes that did not pass the filter.
+
+::: text-green
+I found a bit challenging deciding what to do with NA (convert all to 0 or remove). Converting to 0 is convenient for preserving all data, including patient data and genes with low expression or insufficient information. Since the task also requires creating metadata using the CNA level of ERBB2+, I did not include in the matrix assay those patients who are not in the cna_ids. If NA values mean no expression, it is logical to interpret them as zeros. But if NAs are due to missing data or low quality, interpreting them as 0 may be incorrect (too many genes with "zero" expression can increase the noise level). Removing NAs excludes genes with insufficient information, which increases confidence in the statistics. log2FoldChange, p-value, and padj are calculated correctly only for genes with full information, which makes the results more reliable. And given that the number of NAs is small, and the goal is to identify more expressed genes, I removed them to perform with minimal noise.
+:::
+
+```{r}
+assay[assay<0] = 0
+
+# Findind identifiers that are not in metadata
+ids_to_remove <- setdiff(substr(colnames(assay), 1, 12), metadata[, 1])
+# Finding the indexes of the columns corresponding to these identifiers
+cols_to_remove <- which(substr(colnames(assay), 1, 12) %in% ids_to_remove)
+# Removing columns from assay
+filtered_assay <- assay[, -cols_to_remove]
+
+# Check: order must be identical to colnames(assay)
+# all(colnames(filtered_assay) == metadata$`Patient ID`)
+
+# Filtering out genes with too many missing values
+smallestGroupSize = 3
+keep = rowSums(filtered_assay >= 10) >= smallestGroupSize
+filtered_assay = filtered_assay[keep,]
+```
+
+`DESeqDataSetFromMatrix()` creates a DESeqDataSet object that is used for analysis with `DESeq2()`. It is passed a matrix of gene reads (`filtered_assay`) (where the rows are genes and the columns are patient IDs), along with metadata and an experimental design formula (dividing samples into HER2-amplified (1) versus HER2-not-amplified (0) groups, between which `DESeq2` will compare genes). Subsequently, `DESeq()` performs the following: read normalisation for each sample taking into account the total number of reads, calculation of logarithmic expression changes (`log2FoldChange`), statistical analysis (`Wald test` to assess the significance of expression changes, generation of `p-value` and adjusted p-values ​​(`padj`).
+
+```{r}
+library(DESeq2, quietly = TRUE)
+
+dds <- DESeqDataSetFromMatrix(
+  countData = filtered_assay,
+  colData = metadata,
+  design = ~ HER2_Status
+)
+dds <- DESeq(dds)  # Normalization and analysis
+```
+
+`resultsNames()` allows you to see which groups are being compared and what coefficients can be extracted. In this case, the analysis is performed for the `HER2_Status` variable, where two groups are compared: 1 and 0. `results()` retrieves the results of differential gene expression analysis. The function `order(res$log2FoldChange)` returns the indices of rows in `res`, sorted by `log2FoldChange` in ascending order. Using `decreasing = TRUE` sorts the rows in descending order.
+
+```{r}
+resultsNames(dds)
+res = results(dds)
+print(res)
+#Top 10 most differentially expressed genes with the smallest Fold Change 
+res[order(res$log2FoldChange)[1:10], ]
+# Top 10 most differentially expressed genes with the largest Fold Change
+res[order(res$log2FoldChange, decreasing = TRUE)[1:10], ]
+```
+
+The code checks for and installs missing packages that are used to visualize differential gene expression results and create graphs.
+
+```{r}
+#if (!require("EnhancedVolcano", quietly = TRUE))
+#  BiocManager::install("EnhancedVolcano")
+#if (!require("ggplot2", quietly = TRUE))
+#  install.packages("ggplot2")
+#if (!require("ggrepel", quietly = TRUE))
+#  install.packages("ggrepel")
+```
+
+The code creates a volcano plot that visualizes the results of differential gene expression analysis between two groups: HER2 Amplified and Not Amplified. The plot shows the `log2FoldChange` expression change on the X-axis and the statistical significance (adjusted p-value) on the Y-axis. `pdf()/dev.off()` opens/closes the PDF plotter to save it in vector format. The main plotting function is `EnhancedVolcano(),` where res is the results of differential expression analysis (an object returned by `DESeq2`). Significance cutoffs: `pCutoff = 0.05`: p-value (genes with `padj < 0.05` are considered significant), `FCcutoff = 1.5`: expression change $(\text{log2FoldChange} > 1.5$ or $< -1.5$). This is equivalent to a fold change ratio of $2^{1.5}\approx 2.8$.
+
+```{r, fig.width=10, fig.height=6, fig.cap="Volcano Plot:HER2 Amplified vs Not Amplified"}
+library(EnhancedVolcano, quietly = TRUE)
+# pdf("VolcanoPlotHER2.pdf", width = 10, height = 5.8)
+# Building a volcano plot
+EnhancedVolcano(
+  res,  # DESeq2 results
+  lab = rownames(res),  # Genes names
+  x = 'log2FoldChange',  # Axis X: log2FoldChange
+  y = 'padj',  # Axis Y: Adjusted p-values 
+  pCutoff = 0.05,  # p-value significance threshold
+  FCcutoff = 1.5,  # Change threshold ($fold change = 2^{1.5} \\approx 2.8$)
+  title = 'Volcano Plot: HER2 Amplified vs Not Amplified',
+  subtitle = 'Differentially Expressed Genes',
+  caption = 'log2FoldChange vs Adjusted p-value',
+  pointSize = 2,  # Dot size
+  labSize = 3,  # Text size for genes
+  xlim = c(-5, 5),  # X-axis limits
+  ylim = c(0, -log10(min(res$padj, na.rm = TRUE))),  # Y-axis limits
+  col = c('grey30', 'forestgreen', 'royalblue', 'red2'), # Dot colors
+  colAlpha = 0.6,  # Transparency of dots
+  legendPosition = 'top',  # Legend Position
+  legendLabSize = 10
+)
+
+# dev.off()
+```
+
+`vst()` is a function to perform a variational stabilizing transformation, i.e. transforms the expression data to reduce the influence of genes with high variance. PCA is sensitive to data with high variance. If stabilization is not performed, genes with high variability may dominate, making interpretation difficult. The result is a `vsd` object that contains the normalized expression data. `plotPCA()` is a function from the `DESeq2` package that plots the Principal Component Analysis (PCA) plot. Since I previously converted the `HER2_Status` data to a factor, the points will be colored by category, not by gradient (as in the numeric one). Since in the task we need to analyze between the Amplified and Not Amplified categories, even if the type were numeric, the result would still only be colored in two colors.
+
+```{r}
+vsd = vst(dds)
+# pdf("PCA.pdf", width = 8, height = 6)
+plotPCA(vsd, intgroup=c("HER2_Status"))
+# dev.off()
+```
+
+The code checks if the required packages are installed: `fgsea` (a gene set enrichment analysis (GSEA) that helps determine whether certain genes are associated with biological processes, pathways, or phenotypes), `clusterProfiler` (enrichment analyses of KEGG (Kyoto Encyclopedia of Genes and Genomes) pathways, GO (Gene Ontology) terms), `org.Hs.eg.db` (a human annotation database containing information about genes), and enrichplot (a visualisation of enrichment analysis results), and if not, installs them.
+
+```{r}
+#if (!requireNamespace("BiocManager", quietly = TRUE))
+#  install.packages("BiocManager")
+#BiocManager::install("fgsea")
+#if (!requireNamespace("clusterProfiler", quietly = TRUE))
+#  BiocManager::install("clusterProfiler")
+#if (!requireNamespace("org.Hs.eg.db", quietly = TRUE))
+#  BiocManager::install("org.Hs.eg.db")
+#if (!requireNamespace("enrichplot", quietly = TRUE))
+#  install.packages("enrichplot")
+```
+
+The code filters differentially expressed genes, separates them into over- and underexpressed genes, performs Gene Ontology (GO) Enrichment Analysis using the "Biological Process" ontology for over- and underexpressed genes, and plots `dotplot()` scatter plots to show the top 10 enriched biological processes for each gene group.
+
+```{r}
+library(clusterProfiler, quietly = TRUE)
+library(enrichplot, quietly = TRUE)
+library(org.Hs.eg.db, quietly = TRUE)
+
+# get subset of differentially expressed genes.
+res_sig = res[res$padj<0.05,] # Filtering genes with adjusted p-value $(padj) < 0.05$
+head(res_sig)
+
+# separate into over and under expressed using log2foldchange
+DE_over = rownames(res_sig[res_sig$log2FoldChange>0,]) # List of overexpressed genes 
+DE_under = rownames(res_sig[res_sig$log2FoldChange<0,]) 
+
+# Enrichment analysis for overexpressed genes
+go_results_over = enrichGO(
+  gene          = DE_over,      # Vector of overexpressed genes
+  OrgDb         = org.Hs.eg.db, # Human Gene Annotation Database
+  keyType       = "SYMBOL",     # Gene identifier type (gene symbols)
+  ont           = "BP",         # Ontology: Biological Process
+  pAdjustMethod = "BH",         # p-value adjustment method (Benjamini-Hochberg)
+  pvalueCutoff  = 0.05,         # p-value threshold 
+  qvalueCutoff  = 0.05          # q-value threshold 
+)
+# print and plot results
+# print(head(go_results_over))
+dotplot(go_results_over, showCategory=10) + ggtitle("Gene Ontology Enrichment over Expressed")
+
+# Enrichment analysis for underexpressed genes
+go_results_under = enrichGO(
+  gene          = DE_under,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",  
+  ont           = "BP", 
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05
+)
+# print and plot results
+# print(head(go_results_under))
+dotplot(go_results_under, showCategory=10) + ggtitle("Gene Ontology Enrichment Under Expressed")
+```
+
+Required packages in R: pathview (visualization of metabolic and signaling pathways using KEGG data), ReactomePA (pathway analysis based on the Reactome database).
+
+```{r}
+#if (!requireNamespace("pathview", quietly = TRUE))
+#  BiocManager::install("pathview")
+#if (!requireNamespace("ReactomePA", quietly = TRUE))
+#  BiocManager::install("ReactomePA")
+```
+
+The `bitr()` function converts gene symbols (SYMBOL) into ENTREZID unique numeric identifiers for later use. The `enrichKEGG()` function performs KEGG (Kyoto Encyclopedia of Genes and Genomes) enrichment on the supplied genes. Some results and a visualization of the top 10 enriched KEGG pathways for the two groups are also output.
+
+```{r}
+library(ReactomePA, quietly = TRUE)
+library(pathview, quietly = TRUE)
+
+# Convert gene symbols (SYMBOL) to their ENTREZ identifiers to use them in Reactome and KEGG analysis
+gene_entrez_over <- bitr(
+  DE_over,
+  fromType = "SYMBOL",    # Type of source data identifier (gene symbols)
+  toType   = "ENTREZID",  # Target ID type (ENTREZ ID)
+  OrgDb    = org.Hs.eg.db
+)
+gene_entrez_under <- bitr(
+  DE_under,
+  fromType = "SYMBOL",
+  toType   = "ENTREZID",
+  OrgDb    = org.Hs.eg.db
+)
+
+#KEGG
+kegg_results_over =  enrichKEGG(
+  gene          = gene_entrez_over[,2],  # Column with ENTREZ ID from transformed data
+  organism      = "human",   
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05
+)
+# print(head(kegg_results_over))
+dotplot(kegg_results_over, showCategory=10) + ggtitle("Kegg Pathway Enrichment Over Expressed")
+
+kegg_results_under =  enrichKEGG(
+  gene          = gene_entrez_under[,2],
+  organism      = "human",   
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05
+)
+# print(head(kegg_results_under))
+dotplot(kegg_results_under, showCategory=10) + ggtitle("Kegg Pathway Enrichment Under Expressed")
+```
+
+The `enrichPathway()` function performs Reactome Pathway Enrichment Analysis for up- and downregulated genes based on gene identifiers (ENTREZ IDs). For each group, it saves a PDF file visualizing the 10 most enriched pathways.
+
+```{r}
+# Reactome
+# pdf("ReactomeOver.pdf", width = 10, height = 5.8)
+reactome_results_over =  enrichPathway(
+  gene          = gene_entrez_over[,2],
+  organism      = "human",   
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+)
+# print(head(reactome_results_over))
+dotplot(reactome_results_over, showCategory=10) + ggtitle("Reactome Pathway Enrichment Over Expressed")
+# dev.off()
+
+# pdf("ReactomeUnder.pdf", width = 10, height = 5.8)
+reactome_results_under =  enrichPathway(
+  gene          = gene_entrez_under[,2],
+  organism      = "human",   
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+)
+# print(head(reactome_results_under))
+dotplot(reactome_results_under, showCategory=10) + ggtitle("Reactome Pathway Enrichment Under Expressed")
+# dev.off()
+```
+
+The code calculates the similarity of GO terms and enriched KEGG/Reactome pathways for overexpressed and underexpressed genes using the `pairwise_termsim()` function. It plots treeplots (`treeplot()`) to visualize the hierarchical structure.
+
+```{r}
+# GO
+# go_results_over_pw = pairwise_termsim(go_results_over)
+# treeplot(go_results_over_pw) + ggtitle("GO Enrichment Over Expressed")
+# go_results_under_pw = pairwise_termsim(go_results_under)
+# treeplot(go_results_under_pw) + ggtitle("Go Enrichment Under Expressed")
+# KEGG
+# kegg_results_over_pw = pairwise_termsim(kegg_results_over)
+# treeplot(kegg_results_over_pw) + ggtitle("KEGG Enrichment Over Expressed")
+# kegg_results_under_pw = pairwise_termsim(kegg_results_under)
+# treeplot(kegg_results_under_pw) + ggtitle("KEGG Enrichment Under Expressed")
+# REACTOME
+# reactome_results_over_pw = pairwise_termsim(reactome_results_over)
+# treeplot(reactome_results_over_pw) + ggtitle("Reactome Enrichment Over Expressed")
+# reactome_results_under_pw = pairwise_termsim(reactome_results_under)
+# treeplot(reactome_results_under_pw) + ggtitle("Reactome Enrichment Under Expressed")
+
+reactome_results_over_pw <- pairwise_termsim(reactome_results_over)
+treeplot(reactome_results_over_pw, main = "Reactome Enrichment Over Expressed")
+reactome_results_under_pw <- pairwise_termsim(reactome_results_under)
+treeplot(reactome_results_under_pw, main = "Reactome Enrichment Under Expressed")
+
+```
+
+We check for the presence of package `pheatmap`, and install it if it is not there.
+
+```{r}
+# install packages for nicer heatmap than R's base one. 
+# if (!requireNamespace("pheatmap", quietly = TRUE))
+#  install.packages("pheatmap")
+library(pheatmap, quietly = TRUE)
+```
+
+The code uses the `assay()` function to extract a matrix of normalized expression data from the `vsd` object, selects the top 20 genes with the lowest `padj`, builds a heatmap of their expression using the `pheatmap()` function, adds row (genes) and column (samples) clustering, applies annotations for HER2 status, and sets colors for visualization. The resulting heatmap is saved as a PDF.
+
+```{r}
+# Subset the dataset on differentially expressed gene 
+top_DE = order(res$padj)
+# To simplify visualization, the top 20 genes with the most significant expression are selected
+vsd_DE = assay(vsd)[top_DE[1:20],]
+# Creation annotations for columns (samples) based on metadata.
+annotation_col = data.frame(HER2_Status = as.matrix(metadata[,2]))
+rownames(annotation_col) = colnames(vsd) # # Set row names to match column names in vsd.
+# Change colors for HER2_Status annotation
+annotation_colors <- list(
+  HER2_Status = c("0" = "springgreen",  
+                  "1" = "blue") 
+)
+# pdf("Heatmap.pdf", width = 10, height = 6)
+pheatmap(
+  vsd_DE,                   # Top 20 gene expression data
+  cluster_rows = TRUE,      # Clustering of strings (genes)
+  cluster_cols = TRUE,      # Clustering of columns (samples)
+  scale = 'row',            # Row-wise scaling (highlights relative differences)
+  show_colnames = FALSE,    # Hiding column names (samples)
+  show_rownames = TRUE,     # Displaying names of genes
+  annotation_col = annotation_col,           # Adding annotations to columns
+  annotation_colors = annotation_colors)     # Applying specified colors to annotations
+# dev.off()
+```
+
+```{r}
+# if (!requireNamespace("survival", quietly = TRUE)) {
+#  install.packages("survival")}
+# if (!requireNamespace("glmnet", quietly = TRUE)) {
+#  install.packages("glmnet")}
+library(survival, quietly = TRUE)
+library(glmnet, quietly = TRUE)
+library(survminer, quietly = TRUE)
+```
+
+We select DE genes that are statistically significant based on the adjusted p-value (`padj < 0.05`), indicating significant expression changes between the compared groups. Only these genes are extracted from the expression matrix `(vsd)` and then transposed for ease of analysis (rows now represent patients, columns - genes). Next, we prepare the data for survival analysis: columns with patient IDs, survival status (DECEASED/ALIVE), and survival time (in months) are extracted from the clinical data table. We convert patient IDs to a unified format (using `gsub()` and `substr()`) so that they can be matched with IDs in the expression matrix. Survival status is converted to binary format (1 for deceased, 0 for alive), and patients with invalid time data are removed. A surv object is created that contains information about survival time and status for each patient. The `glmnet()` function constructs the Lasso-regularised Cox model. `cv.glmnet()` performs cross-validation to select the optimal parameter $\lambda$. `lambda.min` calculates the value of $\lambda$ that minimizes the error (deviance). For each patient, the predicted risk (`predict()`) of death is calculated based on the model. Patients are divided into two groups (high and low risk) by the median value of the predicted risk. Survival curves for the high- and low-risk groups are plotted, where `survfit()` calculates the Kaplan-Meier survival curves and `ggsurvplot()` creates a graph.
+
+::: text-green
+I chose median grouping as the grouping method. Grouping patients by HER2 status makes limited sense in this case, since the DESeq2 model was set to design =\textasciitilde HER2_Status. That is, gene expression analysis was already performed taking into account the HER2 status of the patients, and the differentially expressed genes (DE genes) were selected based on the comparison of two groups: HER2 Amplified and HER2 Not Amplified. Therefore, grouping by HER2 status does not provide new information, since your data is already orientated to identify differences between the groups.
+:::
+
+```{r}
+de_genes <- rownames(res[res$padj < 0.05, ]) # DE gene selection
+x <- t(assay(vsd)[de_genes, ])  # VST values of DE genes, transposed (patients x genes)
+
+# Conversion of identifier formats and preparation of survival data
+surv <- data_patient[, c('X.Patient.Identifier', 'Overall.Survival.Status', 'Overall.Survival..Months.')]
+surv$X.Patient.Identifier <- substr(gsub("-", "\\.", surv$X.Patient.Identifier), 1, 12)
+rownames(x) <- substr(rownames(x), 1, 12)                  # Transforming patient ids
+surv <- surv[surv$X.Patient.Identifier %in% rownames(x), ] # Leave only matching ids
+
+# Transforming survival data
+time <- as.numeric(surv$Overall.Survival..Months.)  # Survival Time
+status <- as.numeric(ifelse(surv$Overall.Survival.Status == "1:DECEASED", 1, 0))  # 1 = dead, 0 = alive
+
+# Remove lines with invalid survival time
+set.seed(123) # For reproducibility
+valid_indices <- time > 0 # Check that time > 0
+time <- time[valid_indices]
+status <- status[valid_indices]
+x <- x[valid_indices, ]  # Removing rows with invalid data
+
+y <- Surv(time, status) # Creating a Survival Object
+
+set.seed(123) # For reproducibility
+fit <- glmnet(x, y, family = "cox")  # Building a Lasso-regularized Cox model
+# plot(fit) 
+
+# Selecting the optimal value of λ through cross-validation
+set.seed(123) # For reproducibility
+cv_fit <- cv.glmnet(x, y, family = "cox", type.measure = "deviance")
+# plot(cv_fit)
+optimal_lambda <- cv_fit$lambda.min # Optimal value of λ
+# cat("Optimal Lambda:", optimal_lambda, "\n")
+
+predicted_risk <- predict(fit, newx = x, s = optimal_lambda, type = "link") # Risk prediction
+# Grouping of patients by risk (median risk value)
+risk_groups <- ifelse(predicted_risk > median(predicted_risk), "High Risk", "Low Risk")
+
+# Creating and visualizing survival curves
+surv_fit <- survfit(y ~ risk_groups)
+# pdf("SA.pdf", width = 10, height = 6)
+ggsurvplot(surv_fit, data = data.frame(time, status, risk_groups), pval = TRUE)
+# dev.off()
+```
+
+The code is almost the same as the previous one, but with a change in risk groups. Additionally, rows from metadata that correspond to patients with incorrect survival time data are removed. A categorical variable `risk_groups` is created, in which patients are divided into two groups depending on their HER2 status: with amplification (`HER2_Status == 1`), the rest of the patients without (`HER2_Status == 0`).
+
+```{r}
+de_genes <- rownames(res[res$padj < 0.05, ])  
+x <- t(assay(vsd)[de_genes, ])
+surv <- data_patient[, c('X.Patient.Identifier', 'Overall.Survival.Status', 'Overall.Survival..Months.')]
+surv$X.Patient.Identifier <- substr(gsub("-", "\\.", surv$X.Patient.Identifier), 1, 12)
+rownames(x) <- substr(rownames(x), 1, 12) 
+surv <- surv[surv$X.Patient.Identifier %in% rownames(x), ]
+
+# Оставляем только идентификаторы в metadata, которые есть в rownames(x)
+metadata <- metadata[metadata$Patient_ID %in% rownames(x), ]
+# Упорядочиваем metadata так, чтобы идентификаторы совпадали с rownames(x)
+metadata <- metadata[match(rownames(x), metadata$Patient_ID), ]
+
+
+time <- as.numeric(surv$Overall.Survival..Months.)  
+status <- as.numeric(ifelse(surv$Overall.Survival.Status == "1:DECEASED", 1, 0))  
+set.seed(123) # For reproducibility
+valid_indices <- time > 0  
+time <- time[valid_indices]
+status <- status[valid_indices]
+x <- x[valid_indices, ] 
+
+metadata <- metadata[valid_indices, ] # Filter metadata to only include rows that correspond to patients with a valid survival time 
+
+y <- Surv(time, status) 
+set.seed(123) # For reproducibility
+fit <- glmnet(x, y, family = "cox")
+set.seed(123) # For reproducibility
+cv_fit <- cv.glmnet(x, y, family = "cox", type.measure = "deviance")
+# plot(cv_fit)
+optimal_lambda <- cv_fit$lambda.min
+# cat("Optimal Lambda:", optimal_lambda, "\n")
+predicted_risk <- predict(fit, newx = x, s = optimal_lambda, type = "link")
+
+# Creating risk groups based on patients' HER2 status
+risk_groups <- ifelse(metadata$HER2_Status == 1, "HER2 Amplified", "HER2 Not Amplified")
+
+surv_fit <- survfit(y ~ risk_groups)
+ggsurvplot(surv_fit, data = data.frame(time, status, risk_groups), pval = TRUE)
+
+```
